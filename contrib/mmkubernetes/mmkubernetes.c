@@ -69,6 +69,7 @@
 #include <unistd.h>
 #include <sys/stat.h>
 #include <libestr.h>
+#include <liblognorm.h>
 #include <json.h>
 #include <curl/curl.h>
 #include <curl/easy.h>
@@ -89,6 +90,10 @@ DEF_OMOD_STATIC_DATA
 DEFobjCurrIf(errmsg)
 DEFobjCurrIf(regexp)
 
+#define HAVE_LOADSAMPLESFROMSTRING 1
+#if defined(NO_LOADSAMPLESFROMSTRING)
+#undef HAVE_LOADSAMPLESFROMSTRING
+#endif
 /* original from fluentd plugin:
  * 'var\.log\.containers\.(?<pod_name>[a-z0-9]([-a-z0-9]*[a-z0-9])?\
  *   (\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*)_(?<namespace>[^_]+)_\
@@ -96,14 +101,23 @@ DEFobjCurrIf(regexp)
  * this is for _tag_ match, not actual filename match - in_tail turns filename
  * into a fluentd tag
  */
-#define DFLT_FILENAME_REGEX "/var/log/containers/"\
-	"([a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*)_([^_]+)_(.+)-([a-z0-9]{64})\\.log$"
+#define DFLT_FILENAME_LNRULES ":/var/log/containers/%pod_name:char-to:.%."\
+	"%container_hash:char-to:_%_"\
+	"%namespace_name:char-to:_%_%container_name:char-to:-%-%container_id:char-to:.%.log\n"\
+	":/var/log/containers/%pod_name:char-to:_%_"\
+	"%namespace_name:char-to:_%_%container_name:char-to:-%-%container_id:char-to:.%.log"
+#define DFLT_FILENAME_RULEBASE "/etc/rsyslog.d/k8s_filename.rulebase"
 /* original from fluentd plugin:
  *   '^(?<name_prefix>[^_]+)_(?<container_name>[^\._]+)\
  *     (\.(?<container_hash>[^_]+))?_(?<pod_name>[^_]+)_\
  *     (?<namespace>[^_]+)_[^_]+_[^_]+$'
  */
-#define DFLT_CONTAINER_REGEX "^[^_]+_([^\\._]+)(\\.([^_]+))?_([^_]+)_([^_]+)_[^_]+_[^_]+$"
+#define DFLT_CONTAINER_LNRULES ":%k8s_prefix:char-to:_%_%container_name:char-to:.%."\
+	"%container_hash:char-to:_%_%"\
+	"%pod_name:char-to:_%_%namespace_name:char-to:_%_%not_used_1:char-to:_%_%not_used_2:rest%\n"\
+	":%k8s_prefix:char-to:_%_%container_name:char-to:_%_"\
+	"%pod_name:char-to:_%_%namespace_name:char-to:_%_%not_used_1:char-to:_%_%not_used_2:rest%"
+#define DFLT_CONTAINER_RULEBASE "/etc/rsyslog.d/k8s_container_name.rulebase"
 #define DFLT_SRCMD_PATH "$!metadata!filename"
 #define DFLT_DSTMD_PATH "$!"
 #define DFLT_DE_DOT 1 /* true */
@@ -138,8 +152,10 @@ struct modConfData_s {
 	uchar *de_dot_separator; /* separator character (default '_') to use for de_dotting */
 	size_t de_dot_separator_len; /* length of separator character */
 	annotation_match_t annotation_match; /* annotation keys must match these to be included in record */
-	uchar *fnRegexStr; /* match for filename to get metadata from json-file log filenames */
-	uchar *contRegexStr; /* match for CONTAINER_NAME to get metadata from the value */
+	char *fnRules; /* lognorm rules for container log filename match */
+	uchar *fnRulebase; /* lognorm rulebase filename for container log filename match */
+	char *contRules; /* lognorm rules for CONTAINER_NAME value match */
+	uchar *contRulebase; /* lognorm rulebase filename for CONTAINER_NAME value match */
 };
 
 /* action (instance) configuration data */
@@ -155,8 +171,12 @@ typedef struct _instanceData {
 	uchar *de_dot_separator; /* separator character (default '_') to use for de_dotting */
 	size_t de_dot_separator_len; /* length of separator character */
 	annotation_match_t annotation_match; /* annotation keys must match these to be included in record */
-	regex_t fnRegex;
-	regex_t contRegex;
+	char *fnRules; /* lognorm rules for container log filename match */
+	uchar *fnRulebase; /* lognorm rulebase filename for container log filename match */
+	ln_ctx fnCtxln;	/**< context to be used for liblognorm */
+	char *contRules; /* lognorm rules for CONTAINER_NAME value match */
+	uchar *contRulebase; /* lognorm rulebase filename for CONTAINER_NAME value match */
+	ln_ctx contCtxln;	/**< context to be used for liblognorm */
 	msgPropDescr_t *contNameDescr; /* CONTAINER_NAME field */
 	msgPropDescr_t *contIdFullDescr; /* CONTAINER_ID_FULL field */
 	struct cache_s *cache;
@@ -182,8 +202,13 @@ static struct cnfparamdescr modpdescr[] = {
 	{ "annotation_match", eCmdHdlrArray, 0 },
 	{ "de_dot", eCmdHdlrBinary, 0 },
 	{ "de_dot_separator", eCmdHdlrString, 0 },
-	{ "filenameregex", eCmdHdlrString, 0 },
-	{ "containerregex", eCmdHdlrString, 0 }
+	{ "filenamerulebase", eCmdHdlrString, 0 },
+	{ "containerrulebase", eCmdHdlrString, 0 }
+#if HAVE_LOADSAMPLESFROMSTRING == 1
+	,
+	{ "filenamerules", eCmdHdlrArray, 0 },
+	{ "containerrules", eCmdHdlrArray, 0 }
+#endif
 };
 static struct cnfparamblk modpblk = {
 	CNFPARAMBLK_VERSION,
@@ -203,8 +228,13 @@ static struct cnfparamdescr actpdescr[] = {
 	{ "annotation_match", eCmdHdlrArray, 0 },
 	{ "de_dot", eCmdHdlrBinary, 0 },
 	{ "de_dot_separator", eCmdHdlrString, 0 },
-	{ "filenameregex", eCmdHdlrString, 0 },
-	{ "containerregex", eCmdHdlrString, 0 }
+	{ "filenamerulebase", eCmdHdlrString, 0 },
+	{ "containerrulebase", eCmdHdlrString, 0 },
+#if HAVE_LOADSAMPLESFROMSTRING == 1
+	,
+	{ "filenamerules", eCmdHdlrArray, 0 },
+	{ "containerrules", eCmdHdlrArray, 0 }
+#endif
 };
 static struct cnfparamblk actpblk =
 	{ CNFPARAMBLK_VERSION,
@@ -385,6 +415,99 @@ static void parse_labels_annotations(struct json_object *jMetadata, annotation_m
 	}
 }
 
+#if HAVE_LOADSAMPLESFROMSTRING == 1
+static int array_to_rules(struct cnfarray *ar, char **rules) {
+	DEFiRet;
+	es_str_t *tmpstr = NULL;
+	es_size_t size = 0;
+
+	if (rules == NULL)
+		FINALIZE;
+	*rules = NULL;
+	if (!ar->nmemb)
+		FINALIZE;
+	for (int jj = 0; jj < ar->nmemb; jj++)
+		size += es_strlen(ar->arr[jj]);
+	if (!size)
+		FINALIZE;
+	CHKmalloc(tmpstr = es_newStr(size));
+	CHKiRet((es_addStr(&tmpstr, ar->arr[0])));
+	CHKiRet((es_addBufConstcstr(&tmpstr, "\n")));
+	for(int jj=1; jj < ar->nmemb; ++jj) {
+		CHKiRet((es_addStr(&tmpstr, ar->arr[jj])));
+		CHKiRet((es_addBufConstcstr(&tmpstr, "\n")));
+	}
+	CHKiRet((es_addBufConstcstr(&tmpstr, "\0")));
+	CHKmalloc(*rules = es_str2cstr(tmpstr, NULL));
+finalize_it:
+	if (tmpstr) {
+		es_deleteStr(tmpstr);
+	}
+    if (iRet != RS_RET_OK) {
+    	free(*rules);
+    	*rules = NULL;
+    }
+	RETiRet;
+}
+#endif
+
+/* callback for liblognorm error messages */
+static void
+errCallBack(void __attribute__((unused)) *cookie, const char *msg,
+	    size_t __attribute__((unused)) lenMsg)
+{
+	errmsg.LogError(0, RS_RET_ERR_LIBLOGNORM, "liblognorm error: %s", msg);
+}
+
+static rsRetVal
+set_lnctx(ln_ctx *ctxln, char *instRules, uchar *instRulebase, char *modRules, uchar *modRulebase)
+{
+	DEFiRet;
+	if (ctxln == NULL)
+		FINALIZE;
+	CHKmalloc(*ctxln = ln_initCtx());
+	ln_setErrMsgCB(*ctxln, errCallBack, NULL);
+	if(instRules) {
+#if HAVE_LOADSAMPLESFROMSTRING == 1
+		if(ln_loadSamplesFromString(*ctxln, instRules) !=0) {
+			errmsg.LogError(0, RS_RET_NO_RULEBASE, "error: normalization rules '%s' "
+					"could not be loaded", instRules);
+			ABORT_FINALIZE(RS_RET_ERR_LIBLOGNORM_SAMPDB_LOAD);
+		}
+#else
+		(void)instRules;
+#endif
+	} else if(instRulebase) {
+		if(ln_loadSamples(*ctxln, (char*) instRulebase) != 0) {
+			errmsg.LogError(0, RS_RET_NO_RULEBASE, "error: normalization rulebase '%s' "
+					"could not be loaded", instRulebase);
+			ABORT_FINALIZE(RS_RET_ERR_LIBLOGNORM_SAMPDB_LOAD);
+		}
+	} else if(modRules) {
+#if HAVE_LOADSAMPLESFROMSTRING == 1
+		if(ln_loadSamplesFromString(*ctxln, modRules) !=0) {
+			errmsg.LogError(0, RS_RET_NO_RULEBASE, "error: normalization rules '%s' "
+					"could not be loaded", modRules);
+			ABORT_FINALIZE(RS_RET_ERR_LIBLOGNORM_SAMPDB_LOAD);
+		}
+#else
+		(void)modRules;
+#endif
+	} else if(modRulebase) {
+		if(ln_loadSamples(*ctxln, (char*) modRulebase) != 0) {
+			errmsg.LogError(0, RS_RET_NO_RULEBASE, "error: normalization rulebase '%s' "
+					"could not be loaded", modRulebase);
+			ABORT_FINALIZE(RS_RET_ERR_LIBLOGNORM_SAMPDB_LOAD);
+		}
+	}
+finalize_it:
+	if (iRet != RS_RET_OK){
+		ln_exitCtx(*ctxln);
+		*ctxln = NULL;
+	}
+	RETiRet;
+}
+
 BEGINbeginCnfLoad
 CODESTARTbeginCnfLoad
 	loadModConf = pModConf;
@@ -396,7 +519,6 @@ BEGINsetModCnf
 	struct cnfparamvals *pvals = NULL;
 	int i;
 	FILE *fp;
-	regex_t rx;
 	int ret;
 CODESTARTsetModCnf
 	pvals = nvlstGetParams(lst, &modpblk, NULL);
@@ -470,42 +592,65 @@ CODESTARTsetModCnf
 		} else if(!strcmp(modpblk.descr[i].name, "de_dot_separator")) {
 			free(loadModConf->de_dot_separator);
 			loadModConf->de_dot_separator = (uchar *) es_str2cstr(pvals[i].val.d.estr, NULL);
-		} else if(!strcmp(modpblk.descr[i].name, "filenameregex")) {
-			free(loadModConf->fnRegexStr);
-			loadModConf->fnRegexStr = (uchar *) es_str2cstr(pvals[i].val.d.estr, NULL);
-			if((ret = regexp.regcomp(&rx, (char *)loadModConf->fnRegexStr, REG_EXTENDED))) {
-				char errMsg[512];
-				regexp.regerror(ret, &rx, errMsg, sizeof(errMsg));
-				iRet = RS_RET_CONFIG_ERROR;
+#if HAVE_LOADSAMPLESFROMSTRING == 1
+		} else if(!strcmp(modpblk.descr[i].name, "filenamerules")) {
+			free(loadModConf->fnRules);
+			CHKiRet((array_to_rules(pvals[i].val.d.ar, &loadModConf->fnRules)));
+#endif
+		} else if(!strcmp(modpblk.descr[i].name, "filenamerulebase")) {
+			free(loadModConf->fnRulebase);
+			loadModConf->fnRulebase = (uchar *) es_str2cstr(pvals[i].val.d.estr, NULL);
+			fp = fopen((const char*)loadModConf->fnRulebase, "r");
+			if(fp == NULL) {
+				char errStr[1024];
+				rs_strerror_r(errno, errStr, sizeof(errStr));
+				iRet = RS_RET_NO_FILE_ACCESS;
 				errmsg.LogError(0, iRet,
-						"error: could not compile 'filenameregex' string [%s]"
-						" into an extended regexp - %d: %s\n",
-						loadModConf->fnRegexStr, ret, errMsg);
-				regexp.regfree(&rx);
+						"error: filenamerulebase file %s couldn't be accessed: %s\n",
+						loadModConf->fnRulebase, errStr);
 				ABORT_FINALIZE(iRet);
+			} else {
+				fclose(fp);
 			}
-			regexp.regfree(&rx);
-		} else if(!strcmp(modpblk.descr[i].name, "containerregex")) {
-			free(loadModConf->contRegexStr);
-			loadModConf->contRegexStr = (uchar *) es_str2cstr(pvals[i].val.d.estr, NULL);
-			if((ret = regexp.regcomp(&rx, (char *)loadModConf->contRegexStr, REG_EXTENDED))) {
-				char errMsg[512];
-				regexp.regerror(ret, &rx, errMsg, sizeof(errMsg));
-				iRet = RS_RET_CONFIG_ERROR;
+#if HAVE_LOADSAMPLESFROMSTRING == 1
+		} else if(!strcmp(modpblk.descr[i].name, "containerrules")) {
+			free(loadModConf->contRules);
+			CHKiRet((array_to_rules(pvals[i].val.d.ar, &loadModConf->contRules)));
+#endif
+		} else if(!strcmp(modpblk.descr[i].name, "containerrulebase")) {
+			free(loadModConf->contRulebase);
+			loadModConf->contRulebase = (uchar *) es_str2cstr(pvals[i].val.d.estr, NULL);
+			fp = fopen((const char*)loadModConf->contRulebase, "r");
+			if(fp == NULL) {
+				char errStr[1024];
+				rs_strerror_r(errno, errStr, sizeof(errStr));
+				iRet = RS_RET_NO_FILE_ACCESS;
 				errmsg.LogError(0, iRet,
-						"error: could not compile 'containerregex' string [%s]"
-						" into an extended regexp - %d: %s\n",
-						loadModConf->contRegexStr, ret, errMsg);
-				regexp.regfree(&rx);
+						"error: containerrulebase file %s couldn't be accessed: %s\n",
+						loadModConf->contRulebase, errStr);
 				ABORT_FINALIZE(iRet);
+			} else {
+				fclose(fp);
 			}
-			regexp.regfree(&rx);
 		} else {
 			dbgprintf("mmkubernetes: program error, non-handled "
 				"param '%s' in module() block\n", modpblk.descr[i].name);
 			/* todo: error message? */
 		}
 	}
+
+#if HAVE_LOADSAMPLESFROMSTRING == 1
+	if (loadModConf->fnRules && loadModConf->fnRulebase) {
+		errmsg.LogError(0, RS_RET_CONFIG_ERROR,
+					"mmkubernetes: only 1 of filenamerules or filenamerulebase may be used");
+		ABORT_FINALIZE(RS_RET_CONFIG_ERROR);
+	}
+	if (loadModConf->contRules && loadModConf->contRulebase) {
+		errmsg.LogError(0, RS_RET_CONFIG_ERROR,
+					"mmkubernetes: only 1 of containerrules or containerrulebase may be used");
+		ABORT_FINALIZE(RS_RET_CONFIG_ERROR);
+	}
+#endif
 
 	/* set defaults */
 	if(loadModConf->srcMetadataPath == NULL)
@@ -515,11 +660,17 @@ CODESTARTsetModCnf
 	if(loadModConf->de_dot_separator == NULL)
 		loadModConf->de_dot_separator = (uchar *) strdup(DFLT_DE_DOT_SEPARATOR);
 	loadModConf->de_dot_separator_len = strlen((const char *)loadModConf->de_dot_separator);
-	if (loadModConf->fnRegexStr == NULL)
-		loadModConf->fnRegexStr = (uchar *) strdup(DFLT_FILENAME_REGEX);
-	if (loadModConf->contRegexStr == NULL)
-		loadModConf->contRegexStr = (uchar *) strdup(DFLT_CONTAINER_REGEX);
-
+#if HAVE_LOADSAMPLESFROMSTRING == 1
+	if (loadModConf->fnRules == NULL && loadModConf->fnRulebase == NULL)
+		loadModConf->fnRules = strdup(DFLT_FILENAME_LNRULES);
+	if (loadModConf->contRules == NULL && loadModConf->contRulebase == NULL)
+		loadModConf->contRules = strdup(DFLT_CONTAINER_LNRULES);
+#else
+	if (loadModConf->fnRulebase == NULL)
+		loadModConf->fnRulebase = (uchar *)strdup(DFLT_FILENAME_RULEBASE);
+	if (loadModConf->contRulebase == NULL)
+		loadModConf->contRulebase = (uchar *)strdup(DFLT_CONTAINER_RULEBASE);
+#endif
 	caches = calloc(1, sizeof(struct cache_s *));
 
 finalize_it:
@@ -542,8 +693,12 @@ CODESTARTfreeInstance
 	free(pData->caCertFile);
 	free(pData->token);
 	free(pData->tokenFile);
-	regexp.regfree(&pData->fnRegex);
-	regexp.regfree(&pData->contRegex);
+	free(pData->fnRules);
+	free(pData->fnRulebase);
+	ln_exitCtx(pData->fnCtxln);
+	free(pData->contRules);
+	free(pData->contRulebase);
+	ln_exitCtx(pData->contCtxln);
 	free_annotationmatch(&pData->annotation_match);
 	free(pData->de_dot_separator);
 	msgPropDescrDestruct(pData->contNameDescr);
@@ -646,11 +801,9 @@ static void cacheFree(struct cache_s *cache)
 
 BEGINnewActInst
 	struct cnfparamvals *pvals = NULL;
-	int i, ret;
+	int i;
 	FILE *fp;
 	char *rxstr = NULL;
-	int haveFnRegex = 0;
-	int haveContRegex = 0;
 	char *srcMetadataPath = NULL;
 CODESTARTnewActInst
 	DBGPRINTF("newActInst (mmkubernetes)\n");
@@ -735,48 +888,69 @@ CODESTARTnewActInst
 		} else if(!strcmp(actpblk.descr[i].name, "de_dot_separator")) {
 			free(pData->de_dot_separator);
 			pData->de_dot_separator = (uchar *) es_str2cstr(pvals[i].val.d.estr, NULL);
-		} else if(!strcmp(actpblk.descr[i].name, "filenameregex")) {
-			regexp.regfree(&pData->fnRegex);
-			rxstr = es_str2cstr(pvals[i].val.d.estr, NULL);
-			if((ret = regexp.regcomp(&pData->fnRegex, rxstr, REG_EXTENDED))) {
-				char errMsg[512];
-				regexp.regerror(ret, &pData->fnRegex, errMsg, sizeof(errMsg));
-				iRet = RS_RET_CONFIG_ERROR;
+#if HAVE_LOADSAMPLESFROMSTRING == 1
+		} else if(!strcmp(modpblk.descr[i].name, "filenamerules")) {
+			free(pData->fnRules);
+			CHKiRet((array_to_rules(pvals[i].val.d.ar, &pData->fnRules)));
+#endif
+		} else if(!strcmp(modpblk.descr[i].name, "filenamerulebase")) {
+			free(pData->fnRulebase);
+			pData->fnRulebase = (uchar *) es_str2cstr(pvals[i].val.d.estr, NULL);
+			fp = fopen((const char*)pData->fnRulebase, "r");
+			if(fp == NULL) {
+				char errStr[1024];
+				rs_strerror_r(errno, errStr, sizeof(errStr));
+				iRet = RS_RET_NO_FILE_ACCESS;
 				errmsg.LogError(0, iRet,
-						"error: could not compile 'filenameregex' string [%s]"
-						" into an extended regexp - %d: %s\n",
-						rxstr, ret, errMsg);
-				free(rxstr);
-				rxstr = NULL;
+						"error: filenamerulebase file %s couldn't be accessed: %s\n",
+						pData->fnRulebase, errStr);
 				ABORT_FINALIZE(iRet);
+			} else {
+				fclose(fp);
 			}
-			free(rxstr);
-			rxstr = NULL;
-			haveFnRegex = 1;
-		} else if(!strcmp(actpblk.descr[i].name, "containerregex")) {
-			regexp.regfree(&pData->contRegex);
-			rxstr = es_str2cstr(pvals[i].val.d.estr, NULL);
-			if((ret = regexp.regcomp(&pData->contRegex, rxstr, REG_EXTENDED))) {
-				char errMsg[512];
-				regexp.regerror(ret, &pData->contRegex, errMsg, sizeof(errMsg));
-				iRet = RS_RET_CONFIG_ERROR;
+#if HAVE_LOADSAMPLESFROMSTRING == 1
+		} else if(!strcmp(modpblk.descr[i].name, "containerrules")) {
+			free(pData->contRules);
+			CHKiRet((array_to_rules(pvals[i].val.d.ar, &pData->contRules)));
+#endif
+		} else if(!strcmp(modpblk.descr[i].name, "containerrulebase")) {
+			free(pData->contRulebase);
+			pData->contRulebase = (uchar *) es_str2cstr(pvals[i].val.d.estr, NULL);
+			fp = fopen((const char*)pData->contRulebase, "r");
+			if(fp == NULL) {
+				char errStr[1024];
+				rs_strerror_r(errno, errStr, sizeof(errStr));
+				iRet = RS_RET_NO_FILE_ACCESS;
 				errmsg.LogError(0, iRet,
-						"error: could not compile 'containerregex' string [%s]"
-						" into an extended regexp - %d: %s\n",
-						rxstr, ret, errMsg);
-				free(rxstr);
-				rxstr = NULL;
+						"error: containerrulebase file %s couldn't be accessed: %s\n",
+						pData->contRulebase, errStr);
 				ABORT_FINALIZE(iRet);
+			} else {
+				fclose(fp);
 			}
-			free(rxstr);
-			rxstr = NULL;
-			haveContRegex = 1;
 		} else {
 			dbgprintf("mmkubernetes: program error, non-handled "
 				"param '%s' in action() block\n", actpblk.descr[i].name);
 			/* todo: error message? */
 		}
 	}
+
+#if HAVE_LOADSAMPLESFROMSTRING == 1
+	if (pData->fnRules && pData->fnRulebase) {
+		errmsg.LogError(0, RS_RET_CONFIG_ERROR,
+					"mmkubernetes: only 1 of filenamerules or filenamerulebase may be used");
+		ABORT_FINALIZE(RS_RET_CONFIG_ERROR);
+	}
+	if (pData->contRules && pData->contRulebase) {
+		errmsg.LogError(0, RS_RET_CONFIG_ERROR,
+					"mmkubernetes: only 1 of containerrules or containerrulebase may be used");
+		ABORT_FINALIZE(RS_RET_CONFIG_ERROR);
+	}
+#endif
+	CHKiRet(set_lnctx(&pData->fnCtxln, pData->fnRules, pData->fnRulebase,
+			loadModConf->fnRules, loadModConf->fnRulebase));
+	CHKiRet(set_lnctx(&pData->contCtxln, pData->contRules, pData->contRulebase,
+			loadModConf->contRules, loadModConf->contRulebase));
 
 	if(pData->kubernetesUrl == NULL) {
 		if(loadModConf->kubernetesUrl == NULL)
@@ -802,29 +976,6 @@ CODESTARTnewActInst
 		copy_annotationmatch(&loadModConf->annotation_match, &pData->annotation_match);
 
 	pData->de_dot_separator_len = strlen((const char *)pData->de_dot_separator);
-
-	if(!haveFnRegex && (ret = regexp.regcomp(&pData->fnRegex, (char *)loadModConf->fnRegexStr, REG_EXTENDED))) {
-		char errMsg[512];
-		regexp.regerror(ret, &pData->fnRegex, errMsg, sizeof(errMsg));
-		iRet = RS_RET_CONFIG_ERROR;
-		errmsg.LogError(0, iRet,
-				"error: could not compile 'filenameregex' string [%s]"
-				" into an extended regexp - %d: %s\n",
-				loadModConf->fnRegexStr, ret, errMsg);
-		ABORT_FINALIZE(iRet);
-	}
-
-	if(!haveContRegex && (ret = regexp.regcomp(
-			&pData->contRegex, (char *)loadModConf->contRegexStr, REG_EXTENDED))) {
-		char errMsg[512];
-		regexp.regerror(ret, &pData->contRegex, errMsg, sizeof(errMsg));
-		iRet = RS_RET_CONFIG_ERROR;
-		errmsg.LogError(0, iRet,
-				"error: could not compile 'containerregex' string [%s]"
-				" into an extended regexp - %d: %s\n",
-				loadModConf->contRegexStr, ret, errMsg);
-		ABORT_FINALIZE(iRet);
-	}
 
 	CHKmalloc(pData->contNameDescr = MALLOC(sizeof(msgPropDescr_t)));
 	CHKiRet(msgPropDescrFill(pData->contNameDescr, (uchar*) DFLT_CONTAINER_NAME, strlen(DFLT_CONTAINER_NAME)));
@@ -894,8 +1045,10 @@ CODESTARTfreeCnf
 	free(pModConf->token);
 	free(pModConf->tokenFile);
 	free(pModConf->de_dot_separator);
-	free(pModConf->fnRegexStr);
-	free(pModConf->contRegexStr);
+	free(pModConf->fnRules);
+	free(pModConf->fnRulebase);
+	free(pModConf->contRules);
+	free(pModConf->contRulebase);
 	free_annotationmatch(&pModConf->annotation_match);
 	for(i = 0; caches[i] != NULL; i++)
 		cacheFree(caches[i]);
@@ -915,6 +1068,12 @@ CODESTARTdbgPrintInstInfo
 	dbgprintf("\ttokenFile='%s'\n", pData->tokenFile);
 	dbgprintf("\tde_dot='%d'\n", pData->de_dot);
 	dbgprintf("\tde_dot_separator='%s'\n", pData->de_dot_separator);
+	dbgprintf("\tfilenamerulebase='%s'\n", pData->fnRulebase);
+	dbgprintf("\tcontainerrulebase='%s'\n", pData->contRulebase);
+#if HAVE_LOADSAMPLESFROMSTRING == 1
+	dbgprintf("\tfilenamerules='%s'\n", pData->fnRules);
+	dbgprintf("\tcontainerrules='%s'\n", pData->contRules);
+#endif
 ENDdbgPrintInstInfo
 
 
@@ -923,22 +1082,17 @@ CODESTARTtryResume
 ENDtryResume
 
 static rsRetVal
-extractMsgMetadata(smsg_t *pMsg, instanceData *pData,
-	char **podName, char **ns, char **contName, char **dockerID)
+extractMsgMetadata(smsg_t *pMsg, instanceData *pData, struct json_object **json)
 {
 	DEFiRet;
-	char *filename, *p;
-	rs_size_t fnLen;
-	unsigned short freeFn = 0;
-	size_t nmatch = 8, len;
-	regmatch_t pmatch[nmatch];
-	uchar *container_name = NULL;
-	rs_size_t container_name_len;
-	unsigned short free_container_name = 0;
-	uchar *container_id_full = NULL;
-	rs_size_t container_id_full_len;
-	unsigned short free_container_id_full = 0;
+	uchar *filename = NULL, *container_name = NULL, *container_id_full = NULL;
+	rs_size_t fnLen, container_name_len, container_id_full_len;
+	unsigned short freeFn = 0, free_container_name = 0, free_container_id_full = 0;
+	int lnret;
 
+	if (!json)
+		FINALIZE;
+	*json = NULL;
 	/* extract metadata from the CONTAINER_NAME field and see if CONTAINER_ID_FULL is present */
 	container_name = MsgGetProp(pMsg, NULL, pData->contNameDescr, &container_name_len, &free_container_name, NULL);
 	container_id_full = MsgGetProp(
@@ -947,78 +1101,38 @@ extractMsgMetadata(smsg_t *pMsg, instanceData *pData,
 	if (container_name && container_id_full && container_name_len && container_id_full_len) {
 		dbgprintf("mmkubernetes: CONTAINER_NAME: '%s'  CONTAINER_ID_FULL: '%s'.\n",
 			container_name, container_id_full);
-		if(REG_NOERROR == regexp.regexec(&pData->contRegex, (char *)container_name, nmatch, pmatch, 0)) {
-			if(pmatch[1].rm_so != -1) {
-				len = pmatch[1].rm_eo - pmatch[1].rm_so;
-				p = malloc(len + 1);
-				memcpy(p, container_name + pmatch[1].rm_so, len);
-				p[len] = '\0';
-				*contName = p;
-			}
-			if(pmatch[4].rm_so != -1) {
-				len = pmatch[4].rm_eo - pmatch[4].rm_so;
-				p = malloc(len + 1);
-				memcpy(p, container_name + pmatch[4].rm_so, len);
-				p[len] = '\0';
-				*podName = p;
-			}
-			if(pmatch[5].rm_so != -1) {
-				len = pmatch[5].rm_eo - pmatch[5].rm_so;
-				p = malloc(len + 1);
-				memcpy(p, container_name + pmatch[5].rm_so, len);
-				p[len] = '\0';
-				*ns = p;
-			}
-			if (free_container_id_full) {
-				/* pass the memory out */
-				*dockerID = (char *)container_id_full;
-				container_id_full = NULL;
-			} else {
-				/* make a copy */
-				*dockerID = strdup((char *)container_id_full);
-			}
+		if ((lnret = ln_normalize(pData->contCtxln, (char*)container_name, container_name_len, json))) {
+			ABORT_FINALIZE(RS_RET_ERR);
+		}
+		/* if we have fields for pod name, namespace name, container name,
+		 * and container id, we are good to go */
+		if (fjson_object_object_get_ex(*json, "pod_name", NULL) &&
+			fjson_object_object_get_ex(*json, "namespace_name", NULL) &&
+			fjson_object_object_get_ex(*json, "container_name", NULL)) {
+			/* add field for container id */
+			json_object_object_add(*json, "container_id", json_object_new_string((const char *)container_id_full));
 			ABORT_FINALIZE(RS_RET_OK);
 		}
 	}
 
 	/* extract metadata from the file name */
-	filename = (char *) MsgGetProp(pMsg, NULL, pData->srcMetadataDescr, &fnLen, &freeFn, NULL);
+	filename = MsgGetProp(pMsg, NULL, pData->srcMetadataDescr, &fnLen, &freeFn, NULL);
 	dbgprintf("mmkubernetes: filename: '%s'.\n", filename);
 	if(filename == NULL)
 		ABORT_FINALIZE(RS_RET_NOT_FOUND);
 
-	if(REG_NOMATCH == regexp.regexec(&pData->fnRegex, filename, nmatch, pmatch, 0))
-		ABORT_FINALIZE(RS_RET_NOT_FOUND);
-
-	if(pmatch[1].rm_so != -1) {
-		len = pmatch[1].rm_eo - pmatch[1].rm_so;
-		p = malloc(len + 1);
-		memcpy(p, filename + pmatch[1].rm_so, len);
-		p[len] = '\0';
-		*podName = p;
+	if ((lnret = ln_normalize(pData->fnCtxln, (char*)filename, fnLen, json))) {
+		ABORT_FINALIZE(RS_RET_ERR);
 	}
-	if(pmatch[5].rm_so != -1) {
-		len = pmatch[5].rm_eo - pmatch[5].rm_so;
-		p = malloc(len + 1);
-		memcpy(p, filename + pmatch[5].rm_so, len);
-		p[len] = '\0';
-		*ns = p;
+	/* if we have fields for pod name, namespace name, container name,
+	 * and container id, we are good to go */
+	if (fjson_object_object_get_ex(*json, "pod_name", NULL) &&
+		fjson_object_object_get_ex(*json, "namespace_name", NULL) &&
+		fjson_object_object_get_ex(*json, "container_name", NULL) &&
+		fjson_object_object_get_ex(*json, "container_id", NULL)) {
+		ABORT_FINALIZE(RS_RET_OK);
 	}
-	if(pmatch[6].rm_so != -1) {
-		len = pmatch[6].rm_eo - pmatch[6].rm_so;
-		p = malloc(len + 1);
-		memcpy(p, filename + pmatch[6].rm_so, len);
-		p[len] = '\0';
-		*contName = p;
-	}
-	if(pmatch[7].rm_so != -1) {
-		len = pmatch[7].rm_eo - pmatch[7].rm_so;
-		p = malloc(len + 1);
-		memcpy(p, filename + pmatch[7].rm_so, len);
-		p[len] = '\0';
-		*dockerID = p;
-	}
-
+	ABORT_FINALIZE(RS_RET_NOT_FOUND);
 finalize_it:
 	if(freeFn)
 		free(filename);
@@ -1026,6 +1140,10 @@ finalize_it:
 		free(container_name);
 	if (free_container_id_full)
 		free(container_id_full);
+	if (iRet != RS_RET_OK) {
+		json_object_put(*json);
+		*json = NULL;
+	}
 	RETiRet;
 }
 
@@ -1087,23 +1205,32 @@ BEGINdoAction_NoStrings
 BEGINdoAction
 	smsg_t *pMsg = (smsg_t*) ppString[0];
 #endif
-	char *podName = NULL, *ns = NULL, *containerName = NULL,
-		*dockerID = NULL, *mdKey = NULL;
-	struct json_object *jMetadata = NULL, *jMetadataCopy = NULL;
+	const char *podName = NULL, *ns = NULL, *containerName = NULL,
+		*containerID = NULL;
+	char *mdKey = NULL;
+	struct json_object *jMetadata = NULL, *jMetadataCopy = NULL, *jMsgMeta = NULL,
+			*jo = NULL;
 	int add_ns_metadata = 0;
 CODESTARTdoAction
-	CHKiRet_Hdlr(extractMsgMetadata(pMsg, pWrkrData->pData,
-				 &podName, &ns, &containerName, &dockerID)) {
+	CHKiRet_Hdlr(extractMsgMetadata(pMsg, pWrkrData->pData, &jMsgMeta)) {
 		ABORT_FINALIZE((iRet == RS_RET_NOT_FOUND) ? RS_RET_OK : iRet);
 	}
 
+	if (fjson_object_object_get_ex(jMsgMeta, "pod_name", &jo))
+		podName = json_object_get_string(jo);
+	if (fjson_object_object_get_ex(jMsgMeta, "namespace_name", &jo))
+		ns = json_object_get_string(jo);
+	if (fjson_object_object_get_ex(jMsgMeta, "container_name", &jo))
+		containerName = json_object_get_string(jo);
+	if (fjson_object_object_get_ex(jMsgMeta, "container_id", &jo))
+		containerID = json_object_get_string(jo);
 	assert(podName != NULL);
 	assert(ns != NULL);
 	assert(containerName != NULL);
-	assert(dockerID != NULL);
+	assert(containerID != NULL);
 
 	dbgprintf("mmkubernetes:\n  podName: '%s'\n  namespace: '%s'\n  containerName: '%s'\n"
-		"  dockerID: '%s'\n", podName, ns, containerName, dockerID);
+		"  containerID: '%s'\n", podName, ns, containerName, containerID);
 
 	/* check cache for metadata */
 	asprintf(&mdKey, "%s_%s_%s", ns, podName, containerName);
@@ -1112,10 +1239,10 @@ CODESTARTdoAction
 
 	if(jMetadata == NULL) {
 		char *url = NULL;
-		struct json_object *jReply = NULL, *jo = NULL, *jo2 = NULL, *jNsMeta = NULL;
+		struct json_object *jReply = NULL, *jo2 = NULL, *jNsMeta = NULL;
 
 		/* check cache for namespace metadata */
-		jNsMeta = hashtable_search(pWrkrData->pData->cache->nsHt, ns);
+		jNsMeta = hashtable_search(pWrkrData->pData->cache->nsHt, (char *)ns);
 
 		if(jNsMeta == NULL) {
 			/* query kubernetes for namespace info */
@@ -1156,8 +1283,7 @@ CODESTARTdoAction
 		free(url);
 		if(iRet != RS_RET_OK) {
 			if(jNsMeta && add_ns_metadata) {
-				hashtable_insert(pWrkrData->pData->cache->nsHt, ns, jNsMeta);
-				ns = NULL;
+				hashtable_insert(pWrkrData->pData->cache->nsHt, strdup(ns), jNsMeta);
 			}
 			json_object_put(jReply);
 			jReply = NULL;
@@ -1191,21 +1317,25 @@ CODESTARTdoAction
 		json_object_put(jReply);
 		jReply = NULL;
 
-		json_object_object_add(jo, "namespace_name", json_object_new_string(ns));
-		json_object_object_add(jo, "pod_name", json_object_new_string(podName));
-		json_object_object_add(jo, "container_name", json_object_new_string(containerName));
+		if (fjson_object_object_get_ex(jMsgMeta, "pod_name", &jo2))
+			json_object_object_add(jo, "pod_name", json_object_get(jo2));
+		if (fjson_object_object_get_ex(jMsgMeta, "namespace_name", &jo2))
+			json_object_object_add(jo, "namespace_name", json_object_get(jo2));
+		if (fjson_object_object_get_ex(jMsgMeta, "container_name", &jo2))
+			json_object_object_add(jo, "container_name", json_object_get(jo2));
 		json_object_object_add(jo, "master_url",
 			json_object_new_string((const char *)pWrkrData->pData->kubernetesUrl));
 		jMetadata = json_object_new_object();
 		json_object_object_add(jMetadata, "kubernetes", jo);
 		jo = json_object_new_object();
-		json_object_object_add(jo, "container_id", json_object_new_string(dockerID));
+		if (fjson_object_object_get_ex(jMsgMeta, "container_id", &jo2))
+			json_object_object_add(jo, "container_id", json_object_get(jo2));
 		json_object_object_add(jMetadata, "docker", jo);
 
 		hashtable_insert(pWrkrData->pData->cache->mdHt, mdKey, jMetadata);
 		mdKey = NULL;
 		if(jNsMeta && add_ns_metadata) {
-			hashtable_insert(pWrkrData->pData->cache->nsHt, ns, jNsMeta);
+			hashtable_insert(pWrkrData->pData->cache->nsHt, strdup(ns), jNsMeta);
 			ns = NULL;
 		}
 	}
@@ -1222,10 +1352,7 @@ CODESTARTdoAction
 	msgAddJSON(pMsg, (uchar *) pWrkrData->pData->dstMetadataPath + 1, jMetadataCopy, 0, 0);
 
 finalize_it:
-	free(podName);
-	free(ns);
-	free(containerName);
-	free(dockerID);
+    json_object_put(jMsgMeta);
 	free(mdKey);
 ENDdoAction
 
