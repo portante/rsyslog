@@ -229,7 +229,7 @@ static struct cnfparamdescr actpdescr[] = {
 	{ "de_dot", eCmdHdlrBinary, 0 },
 	{ "de_dot_separator", eCmdHdlrString, 0 },
 	{ "filenamerulebase", eCmdHdlrString, 0 },
-	{ "containerrulebase", eCmdHdlrString, 0 },
+	{ "containerrulebase", eCmdHdlrString, 0 }
 #if HAVE_LOADSAMPLESFROMSTRING == 1
 	,
 	{ "filenamerules", eCmdHdlrArray, 0 },
@@ -270,7 +270,8 @@ static int init_annotationmatch(annotation_match_t *match, struct cnfarray *ar) 
 	for(int jj = 0; jj < ar->nmemb; ++jj) {
 		int rexret = 0;
 		match->patterns[jj] = (uchar*)es_str2cstr(ar->arr[jj], NULL);
-		rexret = regexp.regcomp(&match->regexps[jj], (char *)match->patterns[jj], REG_EXTENDED|REG_NOSUB);
+		rexret = regexp.regcomp(&match->regexps[jj],
+				(char *)match->patterns[jj], REG_EXTENDED|REG_NOSUB);
 		if (0 != rexret) {
 			char errMsg[512];
 			regexp.regerror(rexret, &match->regexps[jj], errMsg, sizeof(errMsg));
@@ -309,7 +310,8 @@ finalize_it:
  * keys that match - this logic is taken directly from fluent-plugin-kubernetes_metadata_filter
  * except that we do not add the key multiple times to the object to be returned
  */
-static struct json_object *match_annotations(annotation_match_t *match, struct json_object *annotations) {
+static struct json_object *match_annotations(annotation_match_t *match,
+		struct json_object *annotations) {
 	struct json_object *ret = NULL;
 	size_t nmatch = 0; /* ignored REG_NOSUB */
 	regmatch_t pmatch[nmatch]; /* ignored REG_NOSUB */
@@ -337,7 +339,8 @@ static struct json_object *match_annotations(annotation_match_t *match, struct j
  * It will return a brand new hash.  AFAICT, there is no safe way to
  * iterate over the hash while modifying it in place.
  */
-static struct json_object *de_dot_json_object(struct json_object *jobj, const char *delim, size_t delim_len) {
+static struct json_object *de_dot_json_object(struct json_object *jobj,
+		const char *delim, size_t delim_len) {
 	struct json_object *ret = NULL;
 	struct json_object_iterator it = json_object_iter_begin(jobj);
 	struct json_object_iterator itEnd = json_object_iter_end(jobj);
@@ -349,7 +352,8 @@ static struct json_object *de_dot_json_object(struct json_object *jobj, const ch
 		const char *const key = json_object_iter_peek_name(&it);
 		const char *cc = strstr(key, ".");
 		if (NULL == cc) {
-			json_object_object_add(ret, key, json_object_get(json_object_iter_peek_value(&it)));
+			json_object_object_add(ret, key,
+					json_object_get(json_object_iter_peek_value(&it)));
 		} else {
 			char *new_key = NULL;
 			const char *prevcc = key;
@@ -369,7 +373,8 @@ static struct json_object *de_dot_json_object(struct json_object *jobj, const ch
 			new_key = es_str2cstr(new_es_key, NULL);
 			es_deleteStr(new_es_key);
 			new_es_key = NULL;
-			json_object_object_add(ret, new_key, json_object_get(json_object_iter_peek_value(&it)));
+			json_object_object_add(ret, new_key,
+					json_object_get(json_object_iter_peek_value(&it)));
 			free(new_key);
 		}
 		json_object_iter_next(&it);
@@ -389,7 +394,8 @@ finalize_it:
  * - de_dot the "labels" and "annotations" fields keys
  * This modifies the jMetadata object in place
  */
-static void parse_labels_annotations(struct json_object *jMetadata, annotation_match_t *match, sbool de_dot,
+static void parse_labels_annotations(struct json_object *jMetadata,
+		annotation_match_t *match, sbool de_dot,
 		const char *delim, size_t delim_len) {
 	struct json_object *jo = NULL;
 
@@ -938,12 +944,12 @@ CODESTARTnewActInst
 #if HAVE_LOADSAMPLESFROMSTRING == 1
 	if (pData->fnRules && pData->fnRulebase) {
 		errmsg.LogError(0, RS_RET_CONFIG_ERROR,
-					"mmkubernetes: only 1 of filenamerules or filenamerulebase may be used");
+		    "mmkubernetes: only 1 of filenamerules or filenamerulebase may be used");
 		ABORT_FINALIZE(RS_RET_CONFIG_ERROR);
 	}
 	if (pData->contRules && pData->contRulebase) {
 		errmsg.LogError(0, RS_RET_CONFIG_ERROR,
-					"mmkubernetes: only 1 of containerrules or containerrulebase may be used");
+			"mmkubernetes: only 1 of containerrules or containerrulebase may be used");
 		ABORT_FINALIZE(RS_RET_CONFIG_ERROR);
 	}
 #endif
@@ -978,9 +984,11 @@ CODESTARTnewActInst
 	pData->de_dot_separator_len = strlen((const char *)pData->de_dot_separator);
 
 	CHKmalloc(pData->contNameDescr = MALLOC(sizeof(msgPropDescr_t)));
-	CHKiRet(msgPropDescrFill(pData->contNameDescr, (uchar*) DFLT_CONTAINER_NAME, strlen(DFLT_CONTAINER_NAME)));
+	CHKiRet(msgPropDescrFill(pData->contNameDescr, (uchar*) DFLT_CONTAINER_NAME,
+			strlen(DFLT_CONTAINER_NAME)));
 	CHKmalloc(pData->contIdFullDescr = MALLOC(sizeof(msgPropDescr_t)));
-	CHKiRet(msgPropDescrFill(pData->contIdFullDescr, (uchar*) DFLT_CONTAINER_ID_FULL, strlen(DFLT_CONTAINER_NAME)));
+	CHKiRet(msgPropDescrFill(pData->contIdFullDescr, (uchar*) DFLT_CONTAINER_ID_FULL,
+			strlen(DFLT_CONTAINER_NAME)));
 
 	/* get the cache for this url */
 	for(i = 0; caches[i] != NULL; i++) {
@@ -1094,14 +1102,16 @@ extractMsgMetadata(smsg_t *pMsg, instanceData *pData, struct json_object **json)
 		FINALIZE;
 	*json = NULL;
 	/* extract metadata from the CONTAINER_NAME field and see if CONTAINER_ID_FULL is present */
-	container_name = MsgGetProp(pMsg, NULL, pData->contNameDescr, &container_name_len, &free_container_name, NULL);
+	container_name = MsgGetProp(pMsg, NULL, pData->contNameDescr,
+								&container_name_len, &free_container_name, NULL);
 	container_id_full = MsgGetProp(
 		pMsg, NULL, pData->contIdFullDescr, &container_id_full_len, &free_container_id_full, NULL);
 
 	if (container_name && container_id_full && container_name_len && container_id_full_len) {
 		dbgprintf("mmkubernetes: CONTAINER_NAME: '%s'  CONTAINER_ID_FULL: '%s'.\n",
 			container_name, container_id_full);
-		if ((lnret = ln_normalize(pData->contCtxln, (char*)container_name, container_name_len, json))) {
+		if ((lnret = ln_normalize(pData->contCtxln, (char*)container_name,
+				container_name_len, json))) {
 			ABORT_FINALIZE(RS_RET_ERR);
 		}
 		/* if we have fields for pod name, namespace name, container name,
@@ -1110,7 +1120,8 @@ extractMsgMetadata(smsg_t *pMsg, instanceData *pData, struct json_object **json)
 			fjson_object_object_get_ex(*json, "namespace_name", NULL) &&
 			fjson_object_object_get_ex(*json, "container_name", NULL)) {
 			/* add field for container id */
-			json_object_object_add(*json, "container_id", json_object_new_string((const char *)container_id_full));
+			json_object_object_add(*json, "container_id",
+								   json_object_new_string((const char *)container_id_full));
 			ABORT_FINALIZE(RS_RET_OK);
 		}
 	}
@@ -1306,7 +1317,8 @@ CODESTARTdoAction
 			json_object_object_add(jo, "pod_id", json_object_get(jo2));
 		if(fjson_object_object_get_ex(jReply, "metadata", &jo2)) {
 			struct json_object *jo3 = NULL;
-			parse_labels_annotations(jo2, &pWrkrData->pData->annotation_match, pWrkrData->pData->de_dot,
+			parse_labels_annotations(jo2, &pWrkrData->pData->annotation_match,
+				pWrkrData->pData->de_dot,
 				(const char *)pWrkrData->pData->de_dot_separator,
 				pWrkrData->pData->de_dot_separator_len);
 			if(fjson_object_object_get_ex(jo2, "annotations", &jo3))
