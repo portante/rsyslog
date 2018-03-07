@@ -1121,7 +1121,7 @@ extractMsgMetadata(smsg_t *pMsg, instanceData *pData, struct json_object **json)
 			fjson_object_object_get_ex(*json, "container_name", NULL)) {
 			/* add field for container id */
 			json_object_object_add(*json, "container_id",
-								   json_object_new_string((const char *)container_id_full));
+					json_object_new_string((const char *)container_id_full));
 			ABORT_FINALIZE(RS_RET_OK);
 		}
 	}
